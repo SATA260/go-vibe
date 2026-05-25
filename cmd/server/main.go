@@ -20,6 +20,7 @@ import (
 	"vibe-kanban-go/internal/msgstore"
 	"vibe-kanban-go/internal/server/routes"
 	"vibe-kanban-go/internal/services/container"
+	"vibe-kanban-go/internal/worktree"
 )
 
 const (
@@ -67,10 +68,12 @@ func run(logger *slog.Logger) error {
 	router.Use(cors)
 
 	stores := msgstore.NewRegistry()
-	containerService := container.NewService(db, stores)
+	worktrees := worktree.NewManager("worktrees")
+	containerService := container.NewService(db, stores, worktrees)
 
 	router.Route("/api", func(r chi.Router) {
 		routes.RegisterHealth(r)
+		routes.RegisterReal(r, containerService)
 		routes.RegisterMock(r, containerService)
 	})
 

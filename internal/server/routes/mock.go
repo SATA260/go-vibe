@@ -43,8 +43,8 @@ func RegisterMock(r chi.Router, service *container.Service) {
 	})
 }
 
-// streamExecutionEvents 将指定 execution_process 的 MsgStore 转成 SSE。
-// 业务逻辑是先回放历史日志，再推送实时日志；如果执行不存在，则发送一次 finished 让前端干净收尾。
+// streamExecutionEvents 将指定 execution_process 的历史 DB 日志和实时 MsgStore 转成 SSE。
+// 业务逻辑是先订阅实时流避免竞态，再回放 DB 历史日志，随后用 seq 去重继续推送实时日志；如果执行不存在或已无实时进程，则发送 finished 干净收尾。
 func streamExecutionEvents(w http.ResponseWriter, req *http.Request, service *container.Service, execID string) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -58,18 +58,63 @@ func streamExecutionEvents(w http.ResponseWriter, req *http.Request, service *co
 	w.Header().Set("X-Accel-Buffering", "no")
 
 	store, ok := service.Stores().Get(execID)
+	var live <-chan msgstore.LogMsg
+	cancel := func() {}
+	if ok {
+		live, cancel = store.SubscribeLive()
+		defer cancel()
+	}
+
+	logs, err := service.GetExecutionLogs(req.Context(), execID)
+	if err != nil {
+		if !errors.Is(err, container.ErrExecutionNotFound) {
+			writeSSE(w, "stderr", err.Error())
+		}
+		writeSSE(w, "finished", "")
+		flusher.Flush()
+		return
+	}
+
+	lastSeq := 0
+	for _, log := range logs.Logs {
+		writeSSEWithID(w, log.Seq, string(log.Kind), log.Data)
+		flusher.Flush()
+		if log.Seq > lastSeq {
+			lastSeq = log.Seq
+		}
+		if log.Kind == msgstore.KindFinished {
+			return
+		}
+	}
+
 	if !ok {
 		writeSSE(w, "finished", "")
 		flusher.Flush()
 		return
 	}
 
-	index := 0
-	for msg := range store.HistoryPlusStream(req.Context()) {
-		writeSSEWithID(w, index, string(msg.Kind), msg.Data)
-		flusher.Flush()
-		index++
-		if msg.Kind == msgstore.KindFinished {
+	for {
+		select {
+		case msg, ok := <-live:
+			if !ok {
+				return
+			}
+			if msg.Seq > 0 && msg.Seq <= lastSeq {
+				continue
+			}
+			eventID := msg.Seq
+			if eventID == 0 {
+				lastSeq++
+				eventID = lastSeq
+			} else {
+				lastSeq = msg.Seq
+			}
+			writeSSEWithID(w, eventID, string(msg.Kind), msg.Data)
+			flusher.Flush()
+			if msg.Kind == msgstore.KindFinished {
+				return
+			}
+		case <-req.Context().Done():
 			return
 		}
 	}

@@ -18,6 +18,7 @@ type LogKind string
 type LogMsg struct {
 	Kind LogKind `json:"kind"`
 	Data string  `json:"data,omitempty"`
+	Seq  int     `json:"seq,omitempty"`
 }
 
 type storedMsg struct {
@@ -114,6 +115,28 @@ func (s *MsgStore) Subscribe() ([]LogMsg, <-chan LogMsg, func()) {
 	}
 
 	return history, ch, cancel
+}
+
+// SubscribeLive 只订阅调用之后产生的实时日志，不回放内存历史。
+// SSE 在先订阅、再查询 DB 历史时使用它，并依靠日志 seq 去重，避免重启回放和实时流混在一起。
+func (s *MsgStore) SubscribeLive() (<-chan LogMsg, func()) {
+	s.mu.Lock()
+	id := s.nextSub
+	s.nextSub++
+	ch := make(chan LogMsg, 128)
+	s.subs[id] = ch
+	s.mu.Unlock()
+
+	cancel := func() {
+		s.mu.Lock()
+		if sub, ok := s.subs[id]; ok {
+			delete(s.subs, id)
+			close(sub)
+		}
+		s.mu.Unlock()
+	}
+
+	return ch, cancel
 }
 
 // HistoryPlusStream 按原 vibe-kanban 语义先发送历史日志，再持续转发实时日志，直到 context 取消或订阅结束。
