@@ -15,6 +15,28 @@ body {
   margin: 0;
 }
 
+button {
+  border: 1px solid #172026;
+  border-radius: 6px;
+  background: #172026;
+  color: #ffffff;
+  cursor: pointer;
+  font: inherit;
+  font-weight: 700;
+  min-height: 40px;
+  padding: 8px 14px;
+}
+
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.48;
+}
+
+button.secondary {
+  background: #ffffff;
+  color: #172026;
+}
+
 .shell {
   display: grid;
   min-height: 100vh;
@@ -23,7 +45,7 @@ body {
 }
 
 .panel {
-  width: min(100%, 560px);
+  width: min(100%, 760px);
   border: 1px solid #c9d5d8;
   border-radius: 8px;
   background: #ffffff;
@@ -46,6 +68,13 @@ h1 {
   line-height: 1;
 }
 
+.top-row,
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
 .status {
   display: inline-flex;
   align-items: center;
@@ -64,12 +93,14 @@ h1 {
   background: #8a9aa0;
 }
 
-.status-ok {
+.status-ok,
+.status-running {
   border-color: #6abf8b;
   color: #136f3b;
 }
 
-.status-ok .dot {
+.status-ok .dot,
+.status-running .dot {
   background: #1e9d55;
 }
 
@@ -80,6 +111,10 @@ h1 {
 
 .status-error .dot {
   background: #cf3f2f;
+}
+
+.status-idle {
+  color: #44545b;
 }
 
 .detail {
@@ -95,5 +130,89 @@ code {
   background: #f6f9fa;
   padding: 12px;
   color: #25343b;
+}
+
+.actions {
+  margin-top: 20px;
+}
+
+.meta {
+  display: grid;
+  gap: 8px;
+  margin-top: 20px;
+}
+
+.meta span {
+  color: #596b73;
+  font-size: 0.82rem;
+  font-weight: 700;
+}
+
+.logs {
+  display: grid;
+  align-content: start;
+  gap: 8px;
+  min-height: 220px;
+  max-height: 360px;
+  margin-top: 20px;
+  overflow: auto;
+  border: 1px solid #d8e1e4;
+  border-radius: 8px;
+  background: #101820;
+  padding: 12px;
+}
+
+.empty {
+  margin: 0;
+  color: #9fb0b8;
+}
+
+.log-line {
+  display: grid;
+  grid-template-columns: 84px minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+  color: #d9e7ec;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 0.9rem;
+}
+
+.log-line span {
+  color: #8db2c4;
+  font-weight: 700;
+}
+
+.log-line pre {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.log-stderr pre,
+.log-stderr span {
+  color: #ffb3a8;
+}
+
+.log-finished pre,
+.log-finished span,
+.log-ready pre,
+.log-ready span {
+  color: #91dda9;
+}
+
+.log-system pre,
+.log-system span {
+  color: #d5c28f;
+}
+
+@media (max-width: 560px) {
+  .panel {
+    padding: 22px;
+  }
+
+  .log-line {
+    grid-template-columns: 1fr;
+    gap: 2px;
+  }
 }
 

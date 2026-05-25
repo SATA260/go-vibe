@@ -17,7 +17,9 @@ import (
 	_ "github.com/golang-migrate/migrate/v4/source/file"
 	_ "github.com/mattn/go-sqlite3"
 
+	"vibe-kanban-go/internal/msgstore"
 	"vibe-kanban-go/internal/server/routes"
+	"vibe-kanban-go/internal/services/container"
 )
 
 const (
@@ -25,6 +27,7 @@ const (
 	defaultDB   = "data/go-vibe.db"
 )
 
+// main 是服务进程入口，负责创建日志器并启动 HTTP 服务。
 func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
 	if err := run(logger); err != nil {
@@ -33,6 +36,7 @@ func main() {
 	}
 }
 
+// run 完成服务启动主流程：读取配置、打开 SQLite、执行迁移、组装路由和业务服务，最后监听 HTTP 端口。
 func run(logger *slog.Logger) error {
 	addr := envOrDefault("GO_VIBE_ADDR", defaultAddr)
 	dbPath := envOrDefault("GO_VIBE_DB", defaultDB)
@@ -62,8 +66,12 @@ func run(logger *slog.Logger) error {
 	router.Use(middleware.Timeout(60 * time.Second))
 	router.Use(cors)
 
+	stores := msgstore.NewRegistry()
+	containerService := container.NewService(db, stores)
+
 	router.Route("/api", func(r chi.Router) {
 		routes.RegisterHealth(r)
+		routes.RegisterMock(r, containerService)
 	})
 
 	server := &http.Server{
@@ -76,6 +84,7 @@ func run(logger *slog.Logger) error {
 	return server.ListenAndServe()
 }
 
+// cors 允许本地 Vite 前端跨端口访问 Go API，开发期先放开常用方法和请求头。
 func cors(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
@@ -89,6 +98,7 @@ func cors(next http.Handler) http.Handler {
 	})
 }
 
+// migrateUp 执行 SQLite 迁移，确保 API 对外服务前已有 M0/M1a 所需表结构。
 func migrateUp(db *sql.DB) error {
 	driver, err := sqlitemigrate.WithInstance(db, &sqlitemigrate.Config{})
 	if err != nil {
@@ -103,7 +113,6 @@ func migrateUp(db *sql.DB) error {
 	if err != nil {
 		return err
 	}
-	defer m.Close()
 
 	if err := m.Up(); err != nil && !errors.Is(err, migrate.ErrNoChange) {
 		return err
@@ -111,6 +120,7 @@ func migrateUp(db *sql.DB) error {
 	return nil
 }
 
+// envOrDefault 读取环境变量；未设置时返回默认值。
 func envOrDefault(key, fallback string) string {
 	value := os.Getenv(key)
 	if value == "" {
