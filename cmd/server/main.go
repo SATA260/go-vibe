@@ -17,6 +17,8 @@ import (
 	_ "github.com/golang-migrate/migrate/v4/source/file"
 	_ "github.com/mattn/go-sqlite3"
 
+	"vibe-kanban-go/internal/executors"
+	"vibe-kanban-go/internal/executors/echo"
 	"vibe-kanban-go/internal/msgstore"
 	"vibe-kanban-go/internal/server/routes"
 	"vibe-kanban-go/internal/services/container"
@@ -69,7 +71,8 @@ func run(logger *slog.Logger) error {
 
 	stores := msgstore.NewRegistry()
 	worktrees := worktree.NewManager("worktrees")
-	containerService := container.NewService(db, stores, worktrees)
+	executorRegistry := executors.NewRegistry(echo.New())
+	containerService := container.NewService(db, stores, worktrees, executorRegistry)
 
 	router.Route("/api", func(r chi.Router) {
 		routes.RegisterHealth(r)

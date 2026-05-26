@@ -41,6 +41,13 @@ type StartWorkspaceResponse = {
   branch: string;
 };
 
+type ExecutorInfo = {
+  id: string;
+  name: string;
+  available: boolean;
+  detail: string;
+};
+
 type Session = {
   id: string;
   workspace_id: string;
@@ -126,6 +133,8 @@ function App() {
   const [reviewStatus, setReviewStatus] = React.useState('Select a workspace to inspect logs and diff.');
   const [repoForm, setRepoForm] = React.useState({ name: '', git_repo_path: '', default_target_branch: 'main' });
   const [taskForm, setTaskForm] = React.useState({ repo_id: '', title: '', description: '' });
+  const [executors, setExecutors] = React.useState<ExecutorInfo[]>([]);
+  const [executionForm, setExecutionForm] = React.useState({ executor_id: 'ECHO', prompt: '' });
   const [expandedRepos, setExpandedRepos] = React.useState<Record<string, boolean>>({});
   const [executionID, setExecutionID] = React.useState('');
   const [worktreePath, setWorktreePath] = React.useState('');
@@ -172,6 +181,7 @@ function App() {
     void loadRepoStructure();
     void loadTasks();
     void loadWorkspaces();
+    void loadExecutors();
     return () => {
       cancelled = true;
       eventSourceRef.current?.close();
@@ -215,6 +225,17 @@ function App() {
       throw new Error(`load workspaces failed: HTTP ${response.status}`);
     }
     setWorkspaces((await response.json()) as WorkspaceSummary[]);
+  }
+
+  // loadExecutors 读取后端注册的执行器列表；M2a 只有 Echo，但 API 形状为 M2b 接 Claude 预留。
+  async function loadExecutors() {
+    const response = await fetch(`${apiBase}/api/executors`);
+    if (!response.ok) {
+      throw new Error(`load executors failed: HTTP ${response.status}`);
+    }
+    const data = (await response.json()) as ExecutorInfo[];
+    setExecutors(data);
+    setExecutionForm((current) => ({ ...current, executor_id: current.executor_id || data[0]?.id || 'ECHO' }));
   }
 
   // loadWorkspaceReview 读取单个 workspace 的详情和 diff，并默认打开它的最新 execution 日志。
@@ -343,7 +364,7 @@ function App() {
     }
   }
 
-  // startTask 调用真实 M1 启动接口：后端会创建 git worktree、落库 session/process，并在 worktree 内运行 Echo。
+  // startTask 调用真实 M2a 启动接口：后端会创建 git worktree、落库 session/process，并交给选中的 executor 运行。
   async function startTask(taskID: string) {
     setLogs([]);
     nextLogID.current = 1;
@@ -353,7 +374,11 @@ function App() {
     setBranch('');
 
     try {
-      const response = await fetch(`${apiBase}/api/tasks/${taskID}/workspaces`, { method: 'POST' });
+      const response = await fetch(`${apiBase}/api/tasks/${taskID}/workspaces`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(executionForm),
+      });
       if (!response.ok) {
         const err = await response.json();
         throw new Error(err.error ?? `HTTP ${response.status}`);
@@ -586,6 +611,32 @@ function App() {
             <button type="button" className="secondary" onClick={() => void loadTasks(taskForm.repo_id)}>
               Refresh
             </button>
+          </div>
+          <div className="executor-controls">
+            <label>
+              <span>Executor</span>
+              <select
+                value={executionForm.executor_id}
+                onChange={(event) =>
+                  setExecutionForm((current) => ({ ...current, executor_id: event.target.value }))
+                }
+              >
+                {executors.length === 0 ? <option value="ECHO">Echo</option> : null}
+                {executors.map((executor) => (
+                  <option value={executor.id} key={executor.id} disabled={!executor.available}>
+                    {executor.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label>
+              <span>Prompt</span>
+              <input
+                value={executionForm.prompt}
+                onChange={(event) => setExecutionForm((current) => ({ ...current, prompt: event.target.value }))}
+                placeholder="Optional prompt for the selected executor"
+              />
+            </label>
           </div>
           <div className="task-list">
             {tasks.length === 0 ? (

@@ -199,13 +199,22 @@ code {
   gap: 12px;
 }
 
+.executor-controls {
+  display: grid;
+  grid-template-columns: minmax(180px, 0.6fr) minmax(0, 1.4fr);
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
 .form label,
+.executor-controls label,
 .meta-grid > div {
   display: grid;
   gap: 6px;
 }
 
 .form span,
+.executor-controls span,
 .meta-grid span {
   color: #596b73;
   font-size: 0.82rem;
@@ -537,7 +546,8 @@ code {
   .grid,
   .meta-grid,
   .review-grid,
-  .compact {
+  .compact,
+  .executor-controls {
     grid-template-columns: 1fr;
   }
 }

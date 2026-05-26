@@ -3,6 +3,7 @@ package routes
 import (
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
@@ -12,6 +13,10 @@ import (
 
 // RegisterReal 注册真实 M1/M1.5 链路接口：登记 repo、创建 task、启动 workspace，并提供审查查询。
 func RegisterReal(r chi.Router, service *container.Service) {
+	r.Get("/executors", func(w http.ResponseWriter, req *http.Request) {
+		writeJSON(w, http.StatusOK, service.ListExecutors(req.Context()))
+	})
+
 	r.Get("/repos", func(w http.ResponseWriter, req *http.Request) {
 		repos, err := service.ListRepos(req.Context())
 		if err != nil {
@@ -68,7 +73,12 @@ func RegisterReal(r chi.Router, service *container.Service) {
 	})
 
 	r.Post("/tasks/{id}/workspaces", func(w http.ResponseWriter, req *http.Request) {
-		response, err := service.StartWorkspace(req.Context(), chi.URLParam(req, "id"))
+		var body container.StartWorkspaceRequest
+		if err := json.NewDecoder(req.Body).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		response, err := service.StartWorkspace(req.Context(), chi.URLParam(req, "id"), body)
 		if err != nil {
 			writeServiceError(w, err)
 			return

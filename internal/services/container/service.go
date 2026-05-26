@@ -9,16 +9,15 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/google/uuid"
 
+	"vibe-kanban-go/internal/executors"
 	"vibe-kanban-go/internal/msgstore"
 	"vibe-kanban-go/internal/worktree"
 )
@@ -64,6 +63,11 @@ type CreateTaskRequest struct {
 	RepoID      string `json:"repo_id"`
 	Title       string `json:"title"`
 	Description string `json:"description"`
+}
+
+type StartWorkspaceRequest struct {
+	ExecutorID string `json:"executor_id"`
+	Prompt     string `json:"prompt"`
 }
 
 type StartResponse struct {
@@ -159,27 +163,35 @@ type executionLogEntry struct {
 	CreatedAt string           `json:"created_at"`
 }
 
+type executorAction struct {
+	Type       string `json:"type"`
+	ExecutorID string `json:"executor_id"`
+	Prompt     string `json:"prompt,omitempty"`
+}
+
 type Service struct {
 	db        *sql.DB
 	stores    *msgstore.Registry
 	wt        *worktree.Manager
+	execs     *executors.Registry
 	processMu sync.Mutex
 	logMu     sync.Mutex
 	processes map[string]*runningProcess
 }
 
 type runningProcess struct {
-	cmd    *exec.Cmd
-	cancel context.CancelFunc
-	done   chan struct{}
+	spawned *executors.Spawned
+	cancel  context.CancelFunc
+	done    chan struct{}
 }
 
 // NewService 创建执行流程服务，持有数据库、日志注册表、worktree 管理器和运行中进程表。
-func NewService(db *sql.DB, stores *msgstore.Registry, wt *worktree.Manager) *Service {
+func NewService(db *sql.DB, stores *msgstore.Registry, wt *worktree.Manager, execs *executors.Registry) *Service {
 	return &Service{
 		db:        db,
 		stores:    stores,
 		wt:        wt,
+		execs:     execs,
 		processes: make(map[string]*runningProcess),
 	}
 }
@@ -458,14 +470,29 @@ func (s *Service) GetExecutionLogs(ctx context.Context, execID string) (Executio
 	return ExecutionLogsResponse{ExecutionProcessID: execID, Logs: logs}, nil
 }
 
-// StartWorkspace 启动真实 M1 执行链路：读取 task/repo，创建 git worktree，落库 workspace/session/process，并在 worktree 中启动 Echo。
-// 这个函数是 mock flow 到真实 harness 的第一条主线；任何一步失败都会阻止进程启动，避免出现没有 worktree 的脏 execution_process。
-func (s *Service) StartWorkspace(ctx context.Context, taskID string) (StartWorkspaceResponse, error) {
+// ListExecutors 返回当前后端注册的执行器列表和可用性，供前端选择后续要启动的 agent。
+func (s *Service) ListExecutors(ctx context.Context) []executors.Info {
+	return s.execs.List(ctx)
+}
+
+// StartWorkspace 启动真实执行链路：读取 task/repo，创建 git worktree，落库 workspace/session/process，并在 worktree 中启动指定 executor。
+// 业务步骤是先解析 executor action，再创建隔离 worktree，随后把 workspace/session/execution_process 一次性落库；任何一步失败都会阻止进程启动，避免出现没有 worktree 的脏 execution_process。
+func (s *Service) StartWorkspace(ctx context.Context, taskID string, req StartWorkspaceRequest) (StartWorkspaceResponse, error) {
 	task, err := s.getTask(ctx, taskID)
 	if err != nil {
 		return StartWorkspaceResponse{}, err
 	}
 	repo, err := s.getRepo(ctx, task.RepoID)
+	if err != nil {
+		return StartWorkspaceResponse{}, err
+	}
+	executorID := normalizeExecutorID(req.ExecutorID)
+	executor, ok := s.execs.Get(executorID)
+	if !ok {
+		return StartWorkspaceResponse{}, fmt.Errorf("%w: executor %s not found", ErrBadRequest, executorID)
+	}
+	action := executorAction{Type: "CodingAgentInitialRequest", ExecutorID: executor.ID(), Prompt: strings.TrimSpace(req.Prompt)}
+	actionJSON, err := json.Marshal(action)
 	if err != nil {
 		return StartWorkspaceResponse{}, err
 	}
@@ -497,7 +524,7 @@ func (s *Service) StartWorkspace(ctx context.Context, taskID string) (StartWorks
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO sessions (id, workspace_id, name, executor_id, executor_config, agent_working_dir, created_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		sessionID, workspaceID, "Echo", "ECHO", `{}`, worktreePath, now,
+		sessionID, workspaceID, executor.Name(), executor.ID(), `{}`, worktreePath, now,
 	); err != nil {
 		return StartWorkspaceResponse{}, fmt.Errorf("insert session: %w", err)
 	}
@@ -507,7 +534,7 @@ func (s *Service) StartWorkspace(ctx context.Context, taskID string) (StartWorks
 			status, started_at
 		)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		execID, sessionID, workspaceID, "coding_agent", "ECHO", `{"type":"echo"}`, "running", now,
+		execID, sessionID, workspaceID, "coding_agent", executor.ID(), string(actionJSON), "running", now,
 	); err != nil {
 		return StartWorkspaceResponse{}, fmt.Errorf("insert execution process: %w", err)
 	}
@@ -516,7 +543,7 @@ func (s *Service) StartWorkspace(ctx context.Context, taskID string) (StartWorks
 	}
 
 	store := s.stores.Create(execID)
-	if err := s.startEcho(ctx, execID, store, worktreePath); err != nil {
+	if err := s.startExecution(ctx, execID, store, executor, worktreePath, action.Prompt); err != nil {
 		_ = s.updateCompletion(context.Background(), execID, "failed", nil)
 		s.pushExecutionLog(context.Background(), execID, store, msgstore.KindStderr, err.Error())
 		s.pushExecutionLog(context.Background(), execID, store, msgstore.KindFinished, "")
@@ -541,6 +568,15 @@ func (s *Service) StartMock(ctx context.Context) (StartResponse, error) {
 	workspaceID := uuid.NewString()
 	sessionID := uuid.NewString()
 	execID := uuid.NewString()
+	executor, ok := s.execs.Get("ECHO")
+	if !ok {
+		return StartResponse{}, fmt.Errorf("%w: executor ECHO not found", ErrBadRequest)
+	}
+	action := executorAction{Type: "CodingAgentInitialRequest", ExecutorID: executor.ID()}
+	actionJSON, err := json.Marshal(action)
+	if err != nil {
+		return StartResponse{}, err
+	}
 
 	cwd, err := os.Getwd()
 	if err != nil {
@@ -581,7 +617,7 @@ func (s *Service) StartMock(ctx context.Context) (StartResponse, error) {
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO sessions (id, workspace_id, name, executor_id, executor_config, agent_working_dir, created_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		sessionID, workspaceID, "Mock Echo", "ECHO", `{}`, workspacePath, now,
+		sessionID, workspaceID, "Mock "+executor.Name(), executor.ID(), `{}`, workspacePath, now,
 	); err != nil {
 		return StartResponse{}, fmt.Errorf("insert session: %w", err)
 	}
@@ -592,7 +628,7 @@ func (s *Service) StartMock(ctx context.Context) (StartResponse, error) {
 			status, started_at
 		)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		execID, sessionID, workspaceID, "coding_agent", "ECHO", `{"type":"echo"}`, "running", now,
+		execID, sessionID, workspaceID, "coding_agent", executor.ID(), string(actionJSON), "running", now,
 	); err != nil {
 		return StartResponse{}, fmt.Errorf("insert execution process: %w", err)
 	}
@@ -602,7 +638,7 @@ func (s *Service) StartMock(ctx context.Context) (StartResponse, error) {
 	}
 
 	store := s.stores.Create(execID)
-	if err := s.startEcho(ctx, execID, store, "."); err != nil {
+	if err := s.startExecution(ctx, execID, store, executor, ".", ""); err != nil {
 		_ = s.updateCompletion(context.Background(), execID, "failed", nil)
 		s.pushExecutionLog(context.Background(), execID, store, msgstore.KindStderr, err.Error())
 		s.pushExecutionLog(context.Background(), execID, store, msgstore.KindFinished, "")
@@ -618,8 +654,8 @@ func (s *Service) StartMock(ctx context.Context) (StartResponse, error) {
 	}, nil
 }
 
-// Stop 停止指定执行进程：先把 DB 状态更新为 killed，再向进程组发终止信号，最后等待 wait goroutine 推送 finished。
-// 如果优雅停止超时，会补发 SIGKILL 并兜底推送 finished，避免前端 SSE 一直挂起。
+// Stop 停止指定执行进程：先把 DB 状态更新为 killed，再调用通用 Spawned.Kill 停止 executor 子进程，最后等待 wait goroutine 推送 finished。
+// 如果优雅停止超时，会调用 ForceKill 兜底并补发 finished，避免前端 SSE 一直挂起；具体 kill 细节由 executor 自己实现。
 func (s *Service) Stop(ctx context.Context, execID string) error {
 	s.processMu.Lock()
 	process, ok := s.processes[execID]
@@ -638,22 +674,16 @@ func (s *Service) Stop(ctx context.Context, execID string) error {
 	}
 
 	timedOut := false
-	if process.cmd.Process != nil {
-		pgid, err := syscall.Getpgid(process.cmd.Process.Pid)
-		if err == nil {
-			_ = syscall.Kill(-pgid, syscall.SIGTERM)
-			select {
-			case <-process.done:
-			case <-time.After(1500 * time.Millisecond):
-				_ = syscall.Kill(-pgid, syscall.SIGKILL)
-				timedOut = true
-			}
-		} else {
-			process.cancel()
-			_ = process.cmd.Process.Kill()
+	if process.spawned.Kill != nil {
+		_ = process.spawned.Kill()
+	}
+	select {
+	case <-process.done:
+	case <-time.After(1500 * time.Millisecond):
+		if process.spawned.ForceKill != nil {
+			_ = process.spawned.ForceKill()
 		}
-	} else {
-		process.cancel()
+		timedOut = true
 	}
 
 	select {
@@ -676,52 +706,43 @@ func (s *Service) Stores() *msgstore.Registry {
 	return s.stores
 }
 
-// startEcho 启动 M1 的 Echo 执行器：运行固定 bash 命令，接管 stdout/stderr，并把进程句柄登记到运行表。
-// 这个阶段故意不抽象 Executor，只验证进程启动、日志捕获、DB 状态更新和 SSE 推送这条链路。
-func (s *Service) startEcho(_ context.Context, execID string, store *msgstore.MsgStore, workingDir string) error {
+// startExecution 启动任意注册执行器，并把通用 Spawned 句柄登记到运行中进程表。
+// 业务步骤是创建独立 context、调用 executor.Spawn、保存 pid、启动 stdout/stderr 采集 goroutine，最后交给 waitForExecution 收敛 DB 状态和 SSE finished。
+func (s *Service) startExecution(_ context.Context, execID string, store *msgstore.MsgStore, executor executors.Executor, workingDir, prompt string) error {
 	ctx, cancel := context.WithCancel(context.Background())
-	cmd := exec.CommandContext(ctx, "bash", "-c", "echo hello && sleep 2 && echo done")
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Dir = workingDir
-
-	stdout, err := cmd.StdoutPipe()
+	spawned, err := executor.Spawn(ctx, executors.SpawnRequest{Dir: workingDir, Prompt: prompt})
 	if err != nil {
 		cancel()
 		return err
 	}
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		cancel()
-		return err
-	}
-	if err := cmd.Start(); err != nil {
-		cancel()
-		return err
-	}
-	if cmd.Process != nil {
-		_, _ = s.db.ExecContext(context.Background(), `UPDATE execution_processes SET pid = ? WHERE id = ?`, cmd.Process.Pid, execID)
+	if spawned.PID > 0 {
+		_, _ = s.db.ExecContext(context.Background(), `UPDATE execution_processes SET pid = ? WHERE id = ?`, spawned.PID, execID)
 	}
 
 	done := make(chan struct{})
 	s.processMu.Lock()
-	s.processes[execID] = &runningProcess{cmd: cmd, cancel: cancel, done: done}
+	s.processes[execID] = &runningProcess{spawned: spawned, cancel: cancel, done: done}
 	s.processMu.Unlock()
 
 	s.pushExecutionLog(context.Background(), execID, store, msgstore.KindReady, "")
-	go streamLines(stdout, func(line string) {
-		s.pushExecutionLog(context.Background(), execID, store, msgstore.KindStdout, line)
-	})
-	go streamLines(stderr, func(line string) {
-		s.pushExecutionLog(context.Background(), execID, store, msgstore.KindStderr, line)
-	})
-	go s.waitForEcho(execID, cmd, cancel, done, store)
+	if spawned.Stdout != nil {
+		go streamLines(spawned.Stdout, func(line string) {
+			s.pushExecutionLog(context.Background(), execID, store, msgstore.KindStdout, line)
+		})
+	}
+	if spawned.Stderr != nil {
+		go streamLines(spawned.Stderr, func(line string) {
+			s.pushExecutionLog(context.Background(), execID, store, msgstore.KindStderr, line)
+		})
+	}
+	go s.waitForExecution(execID, spawned, cancel, done, store)
 
 	return nil
 }
 
-// waitForEcho 等待 echo 进程结束并收敛状态：被 Stop 标记为 killed 时只推 finished；自然退出时按退出码更新 completed/failed。
+// waitForExecution 等待通用 executor 进程结束并收敛状态：被 Stop 标记为 killed 时只推 finished；自然退出时按退出码更新 completed/failed。
 // 无论哪种结束方式，它都会清理运行中进程表并给 SSE 客户端发送 finished。
-func (s *Service) waitForEcho(execID string, cmd *exec.Cmd, cancel context.CancelFunc, done chan struct{}, store *msgstore.MsgStore) {
+func (s *Service) waitForExecution(execID string, spawned *executors.Spawned, cancel context.CancelFunc, done chan struct{}, store *msgstore.MsgStore) {
 	defer close(done)
 	defer cancel()
 	defer func() {
@@ -730,7 +751,7 @@ func (s *Service) waitForEcho(execID string, cmd *exec.Cmd, cancel context.Cance
 		s.processMu.Unlock()
 	}()
 
-	err := cmd.Wait()
+	exitCode, err := spawned.Wait()
 
 	var currentStatus string
 	statusErr := s.db.QueryRowContext(context.Background(), `SELECT status FROM execution_processes WHERE id = ?`, execID).Scan(&currentStatus)
@@ -739,15 +760,9 @@ func (s *Service) waitForEcho(execID string, cmd *exec.Cmd, cancel context.Cance
 		return
 	}
 
-	exitCode := 0
 	status := "completed"
 	if err != nil {
 		status = "failed"
-		exitCode = 1
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
-			exitCode = exitErr.ExitCode()
-		}
 		s.pushExecutionLog(context.Background(), execID, store, msgstore.KindStderr, err.Error())
 	}
 
@@ -855,6 +870,15 @@ func generateWorkspaceBranch(taskID string) string {
 // generateMockBranch 生成 mock workspace 分支名；mock 不创建真实 git 分支，但仍保持和真实链路一致的唯一命名。
 func generateMockBranch(taskID string) string {
 	return "go-vibe/mock-" + shortID(taskID) + "-" + shortID(uuid.NewString())
+}
+
+// normalizeExecutorID 规范化启动请求里的执行器 id；为空时保持向后兼容，默认使用 Echo。
+func normalizeExecutorID(executorID string) string {
+	value := strings.TrimSpace(executorID)
+	if value == "" {
+		return "ECHO"
+	}
+	return strings.ToUpper(value)
 }
 
 // shortID 截取 uuid 前缀，用于生成可读的分支名和调试标识。
